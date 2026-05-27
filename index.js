@@ -1,7 +1,7 @@
 require("dotenv").config();
 const express = require("express");
 const { Client, middleware } = require("@line/bot-sdk");
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+const Groq = require("groq-sdk");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,9 +13,8 @@ const lineConfig = {
 };
 const lineClient = new Client(lineConfig);
 
-// Gemini Config
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+// Groq Config (ฟรี 100%)
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 const BOT_NAME = process.env.BOT_NAME || "น้องAI";
 
@@ -41,44 +40,29 @@ function trimHistory(history, maxTurns = 10) {
   }
 }
 
-async function askGemini(contextId, userMessage, displayName) {
+async function askGroq(contextId, userMessage, displayName) {
   const history = getHistory(contextId);
 
-  // เพิ่มข้อความ user
-  history.push({
-    role: "user",
-    parts: [{ text: `[${displayName}]: ${userMessage}` }],
-  });
-
+  history.push({ role: "user", content: `[${displayName}]: ${userMessage}` });
   trimHistory(history);
 
   try {
-    const chat = model.startChat({
-      history: [
-        {
-          role: "user",
-          parts: [{ text: SYSTEM_PROMPT }],
-        },
-        {
-          role: "model",
-          parts: [{ text: `โอเค! ฉันพร้อมแล้วนะ 😊` }],
-        },
-        ...history.slice(0, -1), // ทุก message ยกเว้นล่าสุด
-      ],
+    const messages = [
+      { role: "system", content: SYSTEM_PROMPT },
+      ...history,
+    ];
+
+    const completion = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      messages,
+      max_tokens: 1024,
     });
 
-    const result = await chat.sendMessage(userMessage);
-    const reply = result.response.text();
-
-    // เก็บ reply ของ bot
-    history.push({
-      role: "model",
-      parts: [{ text: reply }],
-    });
-
+    const reply = completion.choices[0].message.content;
+    history.push({ role: "assistant", content: reply });
     return reply;
   } catch (err) {
-    console.error("Gemini error:", err.message);
+    console.error("Groq error:", err.message);
     return "โอ๊ะ ขอโทษนะ ตอนนี้ฉันสมองแล็ก ลองถามใหม่อีกทีได้เลย 🥲";
   }
 }
@@ -176,7 +160,7 @@ async function handleEvent(event) {
   }
 
   // ถามบอท
-  const reply = await askGemini(contextId, cleanText, displayName);
+  const reply = await askGroq(contextId, cleanText, displayName);
 
   return lineClient.replyMessage(event.replyToken, {
     type: "text",
