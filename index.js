@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const { Client, middleware } = require("@line/bot-sdk");
 const Groq = require("groq-sdk");
+const { Redis } = require("@upstash/redis");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -18,12 +19,16 @@ const lineClient = new Client(lineConfig);
 // Groq Config (ฟรี 100%)
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
+// Upstash Redis — persistent storage (ไม่หายตอน Render sleep)
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
+
 const BOT_NAME = process.env.BOT_NAME || "น้องAI";
 
-// เก็บประวัติสนทนาต่อ group/user (บันทึกลงไฟล์ด้วย)
-const chatHistory = new Map();
-const HISTORY_DIR = path.join(__dirname, "chat_history");
-if (!fs.existsSync(HISTORY_DIR)) fs.mkdirSync(HISTORY_DIR);
+// in-memory cache เพื่อลด latency (Redis เป็น source of truth)
+const chatCache = new Map();
 
 // System prompt สำหรับบอท — แก้ให้สนุกตามใจ
 const SYSTEM_PROMPT = `คุณคือ "${BOT_NAME}" บอทสุดน่ารักของกลุ่มเพื่อนๆ มีนิสัยสนุกสนาน พูดภาษาไทยเป็นหลัก
@@ -38,32 +43,24 @@ function saveReply(displayName, userMessage, aiReply) {
   fs.appendFileSync(LOG_FILE, log, "utf8");
 }
 
-function getHistoryFile(id) {
-  return path.join(HISTORY_DIR, `${id}.json`);
+async function getHistory(id) {
+  if (chatCache.has(id)) return chatCache.get(id);
+  const data = await redis.get(`chat:${id}`);
+  const history = Array.isArray(data) ? data : [];
+  chatCache.set(id, history);
+  return history;
 }
 
-function getHistory(id) {
-  if (!chatHistory.has(id)) {
-    // โหลดจากไฟล์ถ้ามี
-    const file = getHistoryFile(id);
-    try {
-      if (fs.existsSync(file)) {
-        chatHistory.set(id, JSON.parse(fs.readFileSync(file, "utf8")));
-      } else {
-        chatHistory.set(id, []);
-      }
-    } catch {
-      chatHistory.set(id, []);
-    }
-  }
-  return chatHistory.get(id);
-}
-
-function saveHistoryToFile(id) {
-  const history = chatHistory.get(id);
+async function saveHistory(id) {
+  const history = chatCache.get(id);
   if (history) {
-    fs.writeFileSync(getHistoryFile(id), JSON.stringify(history), "utf8");
+    await redis.set(`chat:${id}`, history);
   }
+}
+
+async function deleteHistory(id) {
+  chatCache.delete(id);
+  await redis.del(`chat:${id}`);
 }
 
 function trimHistory(history, maxTurns = 250) {
@@ -97,13 +94,12 @@ function buildMessages(history) {
 }
 
 async function askGroq(contextId, userMessage, displayName) {
-  const history = getHistory(contextId);
+  const history = await getHistory(contextId);
 
   history.push({ role: "user", content: `[${displayName}]: ${userMessage}` });
   trimHistory(history);
 
   try {
-    // recheck — แยกประวัติเก่า (recap) กับล่าสุด (เต็ม)
     const { recap, recentMessages } = buildMessages(history);
 
     const messages = [
@@ -119,7 +115,7 @@ async function askGroq(contextId, userMessage, displayName) {
 
     const reply = completion.choices[0].message.content;
     history.push({ role: "assistant", content: reply });
-    saveHistoryToFile(contextId);
+    await saveHistory(contextId);
     return reply;
   } catch (err) {
     console.error("Groq error:", err.message);
@@ -192,9 +188,7 @@ async function handleEvent(event) {
 
   // คำสั่งพิเศษ
   if (cleanText === "!reset" || cleanText === "/reset") {
-    chatHistory.delete(contextId);
-    const hFile = getHistoryFile(contextId);
-    if (fs.existsSync(hFile)) fs.unlinkSync(hFile);
+    await deleteHistory(contextId);
     return lineClient.replyMessage(event.replyToken, {
       type: "text",
       text: "ล้างความจำแล้วนะ เริ่มใหม่กันเลย! 🧹✨",
