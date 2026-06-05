@@ -1,5 +1,7 @@
 require("dotenv").config();
 const express = require("express");
+const fs = require("fs");
+const path = require("path");
 const { Client, middleware } = require("@line/bot-sdk");
 const Groq = require("groq-sdk");
 
@@ -18,26 +20,80 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 const BOT_NAME = process.env.BOT_NAME || "น้องAI";
 
-// เก็บประวัติสนทนาต่อ group/user (ใน memory, หายเมื่อ restart)
+// เก็บประวัติสนทนาต่อ group/user (บันทึกลงไฟล์ด้วย)
 const chatHistory = new Map();
+const HISTORY_DIR = path.join(__dirname, "chat_history");
+if (!fs.existsSync(HISTORY_DIR)) fs.mkdirSync(HISTORY_DIR);
 
 // System prompt สำหรับบอท — แก้ให้สนุกตามใจ
 const SYSTEM_PROMPT = `คุณคือ "${BOT_NAME}" บอทสุดน่ารักของกลุ่มเพื่อนๆ มีนิสัยสนุกสนาน พูดภาษาไทยเป็นหลัก
 ตอบแบบเพื่อนคุยกัน ไม่เป็นทางการ ใช้ emoji ได้บ้าง ตอบกระชับได้ใจความ
 ถ้าไม่รู้เรื่องก็บอกตรงๆ ว่าไม่รู้ ห้ามสร้างข้อมูลเท็จ`;
 
+const LOG_FILE = path.join(__dirname, "ai_replies.txt");
+
+function saveReply(displayName, userMessage, aiReply) {
+  const timestamp = new Date().toLocaleString("th-TH", { timeZone: "Asia/Bangkok" });
+  const log = `[${timestamp}] ${displayName}: ${userMessage}\n${BOT_NAME}: ${aiReply}\n---\n`;
+  fs.appendFileSync(LOG_FILE, log, "utf8");
+}
+
+function getHistoryFile(id) {
+  return path.join(HISTORY_DIR, `${id}.json`);
+}
+
 function getHistory(id) {
   if (!chatHistory.has(id)) {
-    chatHistory.set(id, []);
+    // โหลดจากไฟล์ถ้ามี
+    const file = getHistoryFile(id);
+    try {
+      if (fs.existsSync(file)) {
+        chatHistory.set(id, JSON.parse(fs.readFileSync(file, "utf8")));
+      } else {
+        chatHistory.set(id, []);
+      }
+    } catch {
+      chatHistory.set(id, []);
+    }
   }
   return chatHistory.get(id);
 }
 
-function trimHistory(history, maxTurns = 10) {
-  // เก็บแค่ 10 รอบล่าสุด เพื่อไม่ให้ใช้ token เยอะ
+function saveHistoryToFile(id) {
+  const history = chatHistory.get(id);
+  if (history) {
+    fs.writeFileSync(getHistoryFile(id), JSON.stringify(history), "utf8");
+  }
+}
+
+function trimHistory(history, maxTurns = 250) {
+  // เก็บ 250 รอบในไฟล์
   if (history.length > maxTurns * 2) {
     history.splice(0, history.length - maxTurns * 2);
   }
+}
+
+function buildMessages(history) {
+  const MAX_RECENT = 20; // 20 รอบล่าสุด ส่งแบบเต็ม
+  const recentCount = MAX_RECENT * 2;
+
+  if (history.length <= recentCount) {
+    return { recap: "", recentMessages: history };
+  }
+
+  // ประวัติเก่า → สรุปย่อให้ AI recheck
+  const older = history.slice(0, -recentCount);
+  const lines = older.map((msg) => {
+    const short = msg.content.length > 80
+      ? msg.content.substring(0, 80) + "..."
+      : msg.content;
+    return msg.role === "user" ? `ผู้ใช้: ${short}` : `บอท: ${short}`;
+  });
+
+  const recap = `\n\n📌 สรุปบทสนทนาก่อนหน้า (recheck):\n${lines.join("\n")}`;
+  const recentMessages = history.slice(-recentCount);
+
+  return { recap, recentMessages };
 }
 
 async function askGroq(contextId, userMessage, displayName) {
@@ -47,9 +103,12 @@ async function askGroq(contextId, userMessage, displayName) {
   trimHistory(history);
 
   try {
+    // recheck — แยกประวัติเก่า (recap) กับล่าสุด (เต็ม)
+    const { recap, recentMessages } = buildMessages(history);
+
     const messages = [
-      { role: "system", content: SYSTEM_PROMPT },
-      ...history,
+      { role: "system", content: SYSTEM_PROMPT + recap },
+      ...recentMessages,
     ];
 
     const completion = await groq.chat.completions.create({
@@ -60,6 +119,7 @@ async function askGroq(contextId, userMessage, displayName) {
 
     const reply = completion.choices[0].message.content;
     history.push({ role: "assistant", content: reply });
+    saveHistoryToFile(contextId);
     return reply;
   } catch (err) {
     console.error("Groq error:", err.message);
@@ -133,6 +193,8 @@ async function handleEvent(event) {
   // คำสั่งพิเศษ
   if (cleanText === "!reset" || cleanText === "/reset") {
     chatHistory.delete(contextId);
+    const hFile = getHistoryFile(contextId);
+    if (fs.existsSync(hFile)) fs.unlinkSync(hFile);
     return lineClient.replyMessage(event.replyToken, {
       type: "text",
       text: "ล้างความจำแล้วนะ เริ่มใหม่กันเลย! 🧹✨",
@@ -161,6 +223,24 @@ async function handleEvent(event) {
 
   // ถามบอท
   const reply = await askGroq(contextId, cleanText, displayName);
+  saveReply(displayName, cleanText, reply);
+
+  // ถ้าอยู่กลุ่ม — @mention คนที่ถาม
+  if (isGroup && source.userId) {
+    return lineClient.replyMessage(event.replyToken, {
+      type: "textV2",
+      text: "{mentionUser} " + reply,
+      substitution: {
+        mentionUser: {
+          type: "mention",
+          mentionee: {
+            type: "user",
+            userId: source.userId,
+          },
+        },
+      },
+    });
+  }
 
   return lineClient.replyMessage(event.replyToken, {
     type: "text",

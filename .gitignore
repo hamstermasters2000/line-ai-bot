@@ -1,3 +1,5 @@
 node_modules/
 .env
 *.log
+ai_replies.txt
+chat_history/
