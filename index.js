@@ -99,7 +99,7 @@ function buildMessages(history) {
 async function askGroq(contextId, userMessage, displayName) {
   const history = await getHistory(contextId);
 
-  history.push({ role: "user", content: `[${displayName}]: ${userMessage}` });
+  history.push({ role: "user", content: `${displayName}: ${userMessage}` });
   trimHistory(history);
 
   try {
