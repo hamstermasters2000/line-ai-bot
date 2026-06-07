@@ -5,6 +5,11 @@ const path = require("path");
 const { Client, middleware } = require("@line/bot-sdk");
 const Groq = require("groq-sdk");
 const { Redis } = require("@upstash/redis");
+const {
+  Client: DiscordClient,
+  GatewayIntentBits,
+  Partials,
+} = require("discord.js");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -111,9 +116,9 @@ async function askGroq(contextId, userMessage, displayName) {
     ];
 
     const completion = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
+      model: "llama-3.1-8b-instant",
       messages,
-      max_tokens: 1024,
+      max_tokens: 512,
     });
 
     const reply = completion.choices[0].message.content;
@@ -251,5 +256,110 @@ app.get("/", (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🤖 ${BOT_NAME} พร้อมแล้ว! PORT: ${PORT}`);
+  console.log(`🤖 ${BOT_NAME} (LINE) พร้อมแล้ว! PORT: ${PORT}`);
 });
+
+// ──────────────────────────────────────────────
+//  DISCORD BOT
+// ──────────────────────────────────────────────
+if (process.env.DISCORD_BOT_TOKEN) {
+  const discord = new DiscordClient({
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.DirectMessages,
+      GatewayIntentBits.MessageContent,
+    ],
+    partials: [Partials.Channel], // จำเป็นสำหรับ DM
+  });
+
+  discord.once("ready", () => {
+    console.log(`🎮 ${BOT_NAME} (Discord) พร้อมแล้ว! Tag: ${discord.user.tag}`);
+  });
+
+  discord.on("messageCreate", async (message) => {
+    // ไม่ตอบบอทด้วยกัน
+    if (message.author.bot) return;
+
+    const isGuild = !!message.guild;
+    const text = message.content.trim();
+
+    if (isGuild) {
+      // ใน server — ตอบเมื่อ mention หรือใช้ trigger word
+      const mentioned = message.mentions.has(discord.user);
+      const triggerWords = ["/ai", "/ถาม", "/ask", `@${BOT_NAME}`];
+      const triggered =
+        mentioned || triggerWords.some((t) => text.toLowerCase().startsWith(t.toLowerCase()));
+
+      if (!triggered) return;
+    }
+    // ใน DM — ตอบได้เลยไม่ต้อง trigger
+
+    // ตัด trigger/mention ออกจากข้อความ
+    let cleanText = text
+      .replace(`<@${discord.user.id}>`, "")   // ตัด mention tag
+      .replace(`<@!${discord.user.id}>`, "")
+      .trim();
+
+    const triggerPrefixes = ["/ai", "/ถาม", "/ask", `@${BOT_NAME}`];
+    for (const t of triggerPrefixes) {
+      if (cleanText.toLowerCase().startsWith(t.toLowerCase())) {
+        cleanText = cleanText.slice(t.length).trim();
+        break;
+      }
+    }
+
+    if (!cleanText) cleanText = "สวัสดี";
+
+    // คำสั่งพิเศษ
+    if (cleanText === "!reset" || cleanText === "/reset") {
+      await deleteHistory(message.channelId);
+      return message.reply("ล้างความจำแล้วนะ เริ่มใหม่กันเลย! 🧹✨");
+    }
+
+    if (cleanText === "!help" || cleanText === "/help") {
+      return message.reply(
+        [
+          `🤖 **${BOT_NAME}** — วิธีใช้งาน Discord`,
+          "",
+          "📌 เรียกใช้ใน server:",
+          `  @${BOT_NAME} [คำถาม]`,
+          "  /ai [คำถาม] หรือ /ถาม [คำถาม]",
+          "",
+          "📌 คำสั่งพิเศษ:",
+          "  /reset — ล้างประวัติสนทนา",
+          "  /help  — แสดงวิธีใช้",
+          "",
+          "💬 ใน DM คุยได้เลยไม่ต้อง mention!",
+        ].join("\n")
+      );
+    }
+
+    const displayName =
+      message.member?.displayName || message.author.globalName || message.author.username;
+
+    // context แยกตาม channel (server) หรือ user (DM)
+    const contextId = isGuild
+      ? `discord:channel:${message.channelId}`
+      : `discord:dm:${message.author.id}`;
+
+    // แสดง typing indicator ระหว่างรอ AI
+    await message.channel.sendTyping();
+
+    const reply = await askGroq(contextId, cleanText, displayName);
+    saveReply(displayName, cleanText, reply);
+
+    // ใน server — @mention คนที่ถาม, ใน DM — reply ธรรมดา
+    if (isGuild) {
+      await message.reply(reply);
+    } else {
+      await message.channel.send(reply);
+    }
+  });
+
+  discord.login(process.env.DISCORD_BOT_TOKEN).catch((err) => {
+    console.error("Discord login failed:", err.message);
+  });
+} else {
+  console.log("⚠️  ไม่พบ DISCORD_BOT_TOKEN — ข้ามการเชื่อมต่อ Discord");
+}
