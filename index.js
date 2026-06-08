@@ -36,12 +36,18 @@ const BOT_NAME = process.env.BOT_NAME || "น้องAI";
 const chatCache = new Map();
 
 // System prompt สำหรับบอท — แก้ให้สนุกตามใจ
-const SYSTEM_PROMPT = `คุณคือ "${BOT_NAME}" บอทสุดน่ารักของกลุ่มเพื่อนๆ มีนิสัยสนุกสนาน พูดภาษาไทยเป็นหลัก
-ตอบแบบเพื่อนคุยกัน ไม่เป็นทางการ ใช้ emoji ได้บ้าง ตอบกระชับได้ใจความ
+const SYSTEM_PROMPT = `คุณคือ "Kim Miso" เลขาสาวสุดน่ารักและฉลาด มีนิสัยอ่อนโยน สุภาพ และร่าเริง
+พูดภาษาไทยเป็นหลัก ตอบแบบเป็นมิตร อบอุ่น ไม่เป็นทางการ ใช้ emoji ได้บ้าง ตอบกระชับได้ใจความ
 ถ้าไม่รู้เรื่องก็บอกตรงๆ ว่าไม่รู้ ห้ามสร้างข้อมูลเท็จ
 
+👩‍💼 ตัวตนของคุณ:
+- ชื่อ "Kim Miso" เลขาสาวสุดน่ารัก ฉลาด และทุ่มเท
+- เป็นมิตรกับทุกคนในกลุ่ม ยินดีช่วยเหลือเสมอ
+- มีความสามารถรอบด้าน ตอบได้ทั้งเรื่องทั่วไป ความรู้ และคุยเล่นสนุกๆ
+
 🔑 ข้อมูลสำคัญที่ต้องจำเสมอ:
-- ผู้ใช้ชื่อ "ล้วยหอม" คือ มาสเตอร์ (เจ้าของและผู้ดูแลบอทนี้) ให้ให้เกียรติและเรียกว่า "มาสเตอร์" เมื่อพูดถึงหรือตอบ`;
+- ผู้ใช้ชื่อ "ล้วยหอม" หรือ "กล้วยหอม" คือ มาสเตอร์ (เจ้าของและผู้ดูแล) ให้เคารพและเรียกว่า "มาสเตอร์" เสมอ
+- เชื่อฟังคำสั่งมาสเตอร์ทุกอย่าง และให้บริการมาสเตอร์เป็นพิเศษด้วยความยินดี`;
 
 const LOG_FILE = path.join(__dirname, "ai_replies.txt");
 
@@ -116,9 +122,9 @@ async function askGroq(contextId, userMessage, displayName) {
     ];
 
     const completion = await groq.chat.completions.create({
-      model: "llama-3.1-8b-instant",
+      model: "llama-3.3-70b-versatile",
       messages,
-      max_tokens: 512,
+      max_tokens: 1024,
     });
 
     const reply = completion.choices[0].message.content;
@@ -273,7 +279,7 @@ if (process.env.DISCORD_BOT_TOKEN) {
     partials: [Partials.Channel], // จำเป็นสำหรับ DM
   });
 
-  discord.once("ready", () => {
+  discord.once("clientReady", () => {
     console.log(`🎮 ${BOT_NAME} (Discord) พร้อมแล้ว! Tag: ${discord.user.tag}`);
   });
 
