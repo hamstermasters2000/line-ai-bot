@@ -207,6 +207,13 @@ async function handleEvent(event) {
 
   const contextId = source.groupId || source.roomId || source.userId;
 
+  if (cleanText === "/myid") {
+    return lineClient.replyMessage(event.replyToken, {
+      type: "text",
+      text: `LINE User ID ของคุณ:\n${source.userId}`,
+    });
+  }
+
   if (cleanText === "!reset" || cleanText === "/reset") {
     await deleteHistory(contextId);
     return lineClient.replyMessage(event.replyToken, {
