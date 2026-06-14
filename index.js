@@ -10,6 +10,14 @@ const {
   GatewayIntentBits,
   Partials,
 } = require("discord.js");
+const {
+  joinVoiceChannel,
+  createAudioPlayer,
+  createAudioResource,
+  AudioPlayerStatus,
+  NoSubscriberBehavior,
+} = require("@discordjs/voice");
+const { MsEdgeTTS, OUTPUT_FORMAT } = require("msedge-tts");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -271,6 +279,60 @@ app.listen(PORT, () => {
   console.log(`🤖 ${BOT_NAME} (LINE) พร้อมแล้ว! PORT: ${PORT}`);
 });
 
+// ── TTS & Voice helpers ─────────────────────────────────────────────────────
+
+const VOICE_IDLE_MS = 2 * 60 * 1000;
+const voiceConnections = new Map();
+const voiceTimeouts = new Map();
+
+async function textToSpeech(text) {
+  const tts = new MsEdgeTTS();
+  await tts.setMetadata("th-TH-PremwadeeNeural", OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+  const { audioStream } = tts.toStream(text);
+  return audioStream;
+}
+
+function resetVoiceTimeout(guildId) {
+  if (voiceTimeouts.has(guildId)) clearTimeout(voiceTimeouts.get(guildId));
+  voiceTimeouts.set(guildId, setTimeout(() => {
+    const conn = voiceConnections.get(guildId);
+    if (conn) conn.destroy();
+    voiceConnections.delete(guildId);
+    voiceTimeouts.delete(guildId);
+  }, VOICE_IDLE_MS));
+}
+
+async function speakInVoice(message, text) {
+  const voiceChannel = message.member?.voice?.channel;
+  if (!voiceChannel) return false;
+
+  try {
+    let connection = voiceConnections.get(message.guild.id);
+    if (!connection || connection.state.status === "destroyed") {
+      connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId: message.guild.id,
+        adapterCreator: message.guild.voiceAdapterCreator,
+      });
+      voiceConnections.set(message.guild.id, connection);
+    }
+
+    const player = createAudioPlayer({
+      behaviors: { noSubscriber: NoSubscriberBehavior.Play },
+    });
+    const audioStream = await textToSpeech(text);
+    const resource = createAudioResource(audioStream);
+
+    connection.subscribe(player);
+    player.play(resource);
+    resetVoiceTimeout(message.guild.id);
+    return true;
+  } catch (err) {
+    console.error("Voice/TTS error:", err.message);
+    return false;
+  }
+}
+
 // ── DISCORD BOT ───────────────────────────────────────────────────────────────
 
 if (process.env.DISCORD_BOT_TOKEN) {
@@ -278,6 +340,7 @@ if (process.env.DISCORD_BOT_TOKEN) {
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.GuildVoiceStates,
       GatewayIntentBits.DirectMessages,
       GatewayIntentBits.MessageContent,
     ],
@@ -322,6 +385,20 @@ if (process.env.DISCORD_BOT_TOKEN) {
       return message.reply("ล้างความจำแล้วนะ เริ่มใหม่กันเลย! 🧹✨");
     }
 
+    if (cleanText === "/leave" || cleanText === "!leave") {
+      const conn = voiceConnections.get(message.guild?.id);
+      if (conn) {
+        conn.destroy();
+        voiceConnections.delete(message.guild.id);
+        if (voiceTimeouts.has(message.guild.id)) {
+          clearTimeout(voiceTimeouts.get(message.guild.id));
+          voiceTimeouts.delete(message.guild.id);
+        }
+        return message.reply("ออกจาก voice channel แล้วค่ะ 👋");
+      }
+      return message.reply("ไม่ได้อยู่ใน voice channel นะคะ 🤔");
+    }
+
     if (cleanText === "!help" || cleanText === "/help") {
       return message.reply(
         [
@@ -333,8 +410,10 @@ if (process.env.DISCORD_BOT_TOKEN) {
           "",
           "📌 คำสั่งพิเศษ:",
           "  /reset — ล้างประวัติสนทนา",
+          "  /leave — ออกจาก voice channel",
           "  /help  — แสดงวิธีใช้",
           "",
+          "🔊 อยู่ใน voice channel? บอทจะพูดเสียงให้ฟัง!",
           "💬 ใน DM คุยได้เลยไม่ต้อง mention!",
         ].join("\n")
       );
@@ -353,7 +432,8 @@ if (process.env.DISCORD_BOT_TOKEN) {
     saveReply(displayName, cleanText, reply);
 
     if (isGuild) {
-      await message.reply(reply);
+      const spoke = await speakInVoice(message, reply);
+      await message.reply(spoke ? `🔊 ${reply}` : reply);
     } else {
       await message.channel.send(reply);
     }
