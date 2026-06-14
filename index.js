@@ -113,7 +113,7 @@ async function deleteHistory(id) {
 
 // ── Core AI call ────────────────────────────────────────────────────────────
 
-async function askGroq(contextId, userMessage, displayName) {
+async function askGroq(contextId, userMessage, displayName, platform) {
   // บันทึกชื่อสมาชิก
   await trackMember(contextId, displayName);
   const members = await getMembers(contextId);
@@ -132,8 +132,13 @@ async function askGroq(contextId, userMessage, displayName) {
       recentReplies.map((r) => `- ${r.content.substring(0, 120)}`).join("\n")
     : "";
 
+  let systemContent = SYSTEM_PROMPT + memberSection + historySection;
+  if (platform === "discord") {
+    systemContent += "\n\n[Discord mode] ตอบสั้นกระชับ ห้ามใช้ emoji เด็ดขาด ถามกลับได้แค่ 1 คำถามสั้นๆ";
+  }
+
   const messages = [
-    { role: "system", content: SYSTEM_PROMPT + memberSection + historySection },
+    { role: "system", content: systemContent },
     { role: "user", content: `${displayName}: ${userMessage}` },
   ];
 
@@ -428,7 +433,7 @@ if (process.env.DISCORD_BOT_TOKEN) {
 
     await message.channel.sendTyping();
 
-    const reply = await askGroq(contextId, cleanText, displayName);
+    const reply = await askGroq(contextId, cleanText, displayName, "discord");
     saveReply(displayName, cleanText, reply);
 
     if (isGuild) {
