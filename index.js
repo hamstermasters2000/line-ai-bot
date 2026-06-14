@@ -129,7 +129,7 @@ async function askGroq(contextId, userMessage, displayName, platform) {
 
   let systemContent = SYSTEM_PROMPT + memberSection;
   if (platform === "discord") {
-    systemContent += "\n[Discord] ห้ามใช้ emoji เด็ดขาด";
+    systemContent += `\n[Discord] ห้ามใช้ emoji เด็ดขาด ตอบคนที่คุยด้วยโดยตรง เรียกชื่อเขา เรียก "ล้วยหอม" ว่า "มาสเตอร์" เท่านั้น คนอื่นเรียกชื่อปกติ`;
   }
 
   const recentHistory = history.slice(-MAX_HISTORY);
