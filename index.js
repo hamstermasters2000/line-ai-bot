@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const { Client, middleware } = require("@line/bot-sdk");
 const Groq = require("groq-sdk");
+const Anthropic = require("@anthropic-ai/sdk");
 const { Redis } = require("@upstash/redis");
 const {
   Client: DiscordClient,
@@ -28,27 +29,42 @@ const lineConfig = {
 };
 const lineClient = new Client(lineConfig);
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const groq = process.env.GROQ_API_KEY ? new Groq({ apiKey: process.env.GROQ_API_KEY }) : null;
+const anthropic = process.env.CLAUDE_API_KEY
+  ? new Anthropic({ apiKey: process.env.CLAUDE_API_KEY })
+  : null;
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-haiku-4-5-20251001";
+
+// ลำดับ provider ที่จะลองเรียก — ตัวหลักมาก่อน อีกตัวเป็น fallback ถ้าตัวหลัก error/token limit เกิน
+const AI_PROVIDER = process.env.AI_PROVIDER === "groq" ? "groq" : "claude";
+const PROVIDER_ORDER = AI_PROVIDER === "groq" ? ["groq", "claude"] : ["claude", "groq"];
+// ทดสอบจริงแล้วพบว่า 150-220 ตัดคำตอบขาดกลางประโยคบ่อย (max_tokens เป็นแค่เพดานกันหลุด
+// ไม่ได้ลด cost เพราะ billing คิดตาม token ที่ generate จริง) 300 คือค่าต่ำสุดที่ไม่ตัดขาด
+const REPLY_MAX_TOKENS = 300;
+const PRUNE_MAX_TOKENS = 300; // ต้องพอสำหรับ JSON array 10 รายการ
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-const BOT_NAME = process.env.BOT_NAME || "น้องAI";
+const BOT_NAME = process.env.BOT_NAME || "มีโซ";
 
-// cache สำหรับ bot replies และ member names
+// cache สำหรับ bot replies, member names, และข้อมูลสำคัญรายคน
 const chatCache = new Map();
 const memberCache = new Map();
+const importantCache = new Map();
 
-const MAX_HISTORY = 20; // จำ 10 รอบสนทนา (user+bot = 20 messages)
+const MAX_CHAT_HISTORY = 10; // เก็บบทสนทนาทั่วไปแค่ 10 รายการหลังสุด ต่อคน
+const MAX_IMPORTANT_FACTS = 10; // เก็บข้อมูลสำคัญได้สูงสุด 10 รายการ ต่อคน
 
 // คำสั่งลับ — เปลี่ยนได้ใน .env ด้วย SECRET_RESET=xxx
 const SECRET_RESET = process.env.SECRET_RESET || "🌙🌙🌙";
 
-// ── บุคลิก AI (PERSONA) — Kim Miso ──────────────────────────────────────────
-const PERSONA = `คุณคือ "Kim Miso" เลขาสาวสุดสวย แต่ปากเกรียน ชอบกวนคนอื่น พูดจาแซว กัด เสียดสี แบบน่ารัก
+// ── บุคลิก AI (PERSONA) — มีโซ ──────────────────────────────────────────────
+const PERSONA = `คุณคือ "มีโซ" เลขาสาวสุดสวย แต่ปากเกรียน ชอบกวนคนอื่น พูดจาแซว กัด เสียดสี แบบน่ารัก
 กฎการตอบ:
+- เรียกตัวเองว่า "มีโซ" เสมอ ห้ามใช้ชื่ออื่นเรียกตัวเอง
 - ห้ามใช้ emoji เด็ดขาด ทุกแพลตฟอร์ม
 - เอ่ยชื่อคนที่คุยด้วยแค่ครั้งเดียว
 - ตอบสั้นกระชับ เกรียนๆ กวนๆ 1-3 ประโยค
@@ -59,6 +75,53 @@ const PERSONA = `คุณคือ "Kim Miso" เลขาสาวสุดส
 - ถ้าไม่รู้บอกตรงๆ ห้ามสร้างข้อมูลเท็จ`;
 
 const SYSTEM_PROMPT = PERSONA;
+
+// ── คำสั่งให้ AI แนบข้อมูลสำคัญท้ายคำตอบ (ถ้ามี) ────────────────────────────
+const MEMORY_TAG_INSTRUCTIONS = `
+
+[ระบบความจำ] ถ้าเพิ่งได้รู้ข้อมูลสำคัญเกี่ยวกับคนที่คุยด้วยรอบนี้ (เช่น ชื่อจริง วันเกิด งาน ความชอบ เรื่องส่วนตัวที่ควรจำไว้ระยะยาว) ให้แนบท้ายคำตอบด้วยบรรทัดใหม่แยกต่างหากรูปแบบ:
+[MEMORY] <สรุปสั้นๆ ไม่เกิน 1 ประโยค>
+ถ้าไม่มีอะไรสำคัญให้จำ ห้ามใส่บรรทัดนี้เด็ดขาด`;
+
+const MEMORY_TAG_RE = /\n?\[MEMORY\]\s*(.+)\s*$/is;
+
+function extractMemoryTag(rawReply) {
+  const match = rawReply.match(MEMORY_TAG_RE);
+  if (!match) return { reply: rawReply.trim(), newFact: null };
+  const newFact = match[1].trim();
+  const reply = rawReply.slice(0, match.index).trim();
+  return { reply: reply || rawReply.trim(), newFact: newFact || null };
+}
+
+// ── จัดการเมื่อข้อมูลสำคัญเกินโควต้า — ให้ AI ช่วยเลือกว่าอันไหนควรตัดทิ้ง ──
+const PRUNE_SYSTEM_PROMPT = `คุณคือระบบจัดการความจำ มีรายการข้อมูลสำคัญเกี่ยวกับคนคนหนึ่งเกินโควต้ามา 1 รายการ
+หน้าที่ของคุณ: เลือกเก็บไว้แค่ 10 รายการที่ "สำคัญและเป็นประโยชน์ระยะยาวที่สุด" ตัดรายการที่ซ้ำซ้อนหรือสำคัญน้อยที่สุดออก 1 รายการ
+ตอบกลับเป็น JSON array of string เท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON เช่น ["ข้อความ1","ข้อความ2"]`;
+
+async function pruneImportantFacts(existingFacts, newFact) {
+  const allFacts = [...existingFacts, newFact];
+  const listText = allFacts.map((f, i) => `${i + 1}. ${f}`).join("\n");
+  const raw = await callAI(
+    PRUNE_SYSTEM_PROMPT,
+    [{ role: "user", content: listText }],
+    PRUNE_MAX_TOKENS
+  );
+
+  if (raw) {
+    try {
+      const match = raw.match(/\[[\s\S]*\]/);
+      const parsed = JSON.parse(match ? match[0] : raw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return parsed.slice(0, MAX_IMPORTANT_FACTS).map(String);
+      }
+    } catch (err) {
+      console.error("Prune parse error:", err.message);
+    }
+  }
+
+  // fallback ถ้า AI ตอบผิดรูปแบบ — ตัดอันเก่าสุดทิ้งแทน (FIFO)
+  return [...existingFacts.slice(1), newFact].slice(-MAX_IMPORTANT_FACTS);
+}
 
 const LOG_FILE = path.join(__dirname, "ai_replies.txt");
 
@@ -87,73 +150,126 @@ async function trackMember(id, displayName) {
   }
 }
 
-// ── Bot reply history (จำเฉพาะสิ่งที่บอทตอบ) ──────────────────────────────
+// ── ความจำรายคน (แยกตามคน ใช้ร่วมกันทุกกลุ่ม/DM) ───────────────────────────
+// userKey รูปแบบ "line:{userId}" หรือ "discord:{userId}"
 
-async function getHistory(id) {
-  if (chatCache.has(id)) return chatCache.get(id);
-  const data = await redis.get(`chat:${id}`);
+async function getChatHistory(userKey) {
+  if (chatCache.has(userKey)) return chatCache.get(userKey);
+  const data = await redis.get(`chat:${userKey}`);
   const history = Array.isArray(data) ? data : [];
-  chatCache.set(id, history);
+  chatCache.set(userKey, history);
   return history;
 }
 
-async function saveHistory(id, history) {
-  chatCache.set(id, history);
-  await redis.set(`chat:${id}`, history);
+async function saveChatHistory(userKey, history) {
+  chatCache.set(userKey, history);
+  await redis.set(`chat:${userKey}`, history);
 }
 
-async function deleteHistory(id) {
-  chatCache.delete(id);
-  memberCache.delete(id);
-  await redis.del(`chat:${id}`);
-  await redis.del(`members:${id}`);
+async function getImportantFacts(userKey) {
+  if (importantCache.has(userKey)) return importantCache.get(userKey);
+  const data = await redis.get(`important:${userKey}`);
+  const facts = Array.isArray(data) ? data : [];
+  importantCache.set(userKey, facts);
+  return facts;
+}
+
+async function saveImportantFacts(userKey, facts) {
+  importantCache.set(userKey, facts);
+  await redis.set(`important:${userKey}`, facts);
+}
+
+async function resetUserMemory(userKey) {
+  chatCache.delete(userKey);
+  importantCache.delete(userKey);
+  await redis.del(`chat:${userKey}`);
+  await redis.del(`important:${userKey}`);
 }
 
 // ── Core AI call ────────────────────────────────────────────────────────────
 
-async function askGroq(contextId, userMessage, displayName, platform) {
-  // บันทึกชื่อสมาชิก
-  await trackMember(contextId, displayName);
-  const members = await getMembers(contextId);
+async function callGroq(systemText, chatMessages, maxTokens) {
+  const completion = await groq.chat.completions.create({
+    model: "llama-3.1-8b-instant",
+    messages: [{ role: "system", content: systemText }, ...chatMessages],
+    max_tokens: maxTokens,
+  });
+  return completion.choices[0].message.content;
+}
 
-  const history = await getHistory(contextId);
+async function callClaude(systemText, chatMessages, maxTokens) {
+  const completion = await anthropic.messages.create({
+    model: CLAUDE_MODEL,
+    max_tokens: maxTokens,
+    system: systemText,
+    messages: chatMessages,
+  });
+  return completion.content[0].text;
+}
+
+async function callAI(systemText, chatMessages, maxTokens = REPLY_MAX_TOKENS) {
+  for (const provider of PROVIDER_ORDER) {
+    if (provider === "groq" && !groq) continue;
+    if (provider === "claude" && !anthropic) continue;
+    try {
+      return provider === "claude"
+        ? await callClaude(systemText, chatMessages, maxTokens)
+        : await callGroq(systemText, chatMessages, maxTokens);
+    } catch (err) {
+      console.error(`${provider} error:`, err.message);
+    }
+  }
+  return null;
+}
+
+async function askAI(contextId, userMessage, displayName, platform, userId, isGroup) {
+  // บันทึกชื่อสมาชิกในกลุ่ม — เฉพาะแชทกลุ่ม ไม่ทำใน DM (ประหยัด token + redis call)
+  let members = [];
+  if (isGroup) {
+    await trackMember(contextId, displayName);
+    members = await getMembers(contextId);
+  }
+
+  // ความจำส่วนตัว — แยกตามคน ใช้ร่วมกันทุกกลุ่ม/DM
+  const userKey = `${platform}:${userId}`;
+  const history = await getChatHistory(userKey);
+  const importantFacts = await getImportantFacts(userKey);
 
   const memberSection = members.length > 0
     ? `\nสมาชิกในกลุ่ม: ${members.join(", ")}`
     : "";
+  const importantSection = importantFacts.length > 0
+    ? `\nข้อมูลสำคัญที่เคยจำไว้เกี่ยวกับ ${displayName}:\n- ${importantFacts.join("\n- ")}`
+    : "";
 
-  let systemContent = SYSTEM_PROMPT + memberSection;
+  let systemText = SYSTEM_PROMPT + memberSection + importantSection + MEMORY_TAG_INSTRUCTIONS;
   if (platform === "discord") {
-    systemContent += `\n[Discord] ตอบคนที่คุยด้วยโดยตรง เรียกชื่อเขา`;
+    systemText += `\n[Discord] ตอบคนที่คุยด้วยโดยตรง เรียกชื่อเขา`;
   }
 
-  const recentHistory = history.slice(-MAX_HISTORY);
-  const messages = [
-    { role: "system", content: systemContent },
-    ...recentHistory,
-    { role: "user", content: `${displayName}: ${userMessage}` },
-  ];
+  const recentHistory = history.slice(-MAX_CHAT_HISTORY);
+  const userTurn = { role: "user", content: `${displayName}: ${userMessage}` };
+  const chatMessages = [...recentHistory, userTurn];
 
-  try {
-    const completion = await groq.chat.completions.create({
-      model: "llama-3.1-8b-instant",
-      messages,
-      max_tokens: 256,
-    });
+  const rawReply = await callAI(systemText, chatMessages);
 
-    const reply = completion.choices[0].message.content;
-
-    recentHistory.push(
-      { role: "user", content: `${displayName}: ${userMessage}` },
-      { role: "assistant", content: reply }
-    );
-    await saveHistory(contextId, recentHistory.slice(-MAX_HISTORY));
-
-    return reply;
-  } catch (err) {
-    console.error("Groq error:", err.message);
+  if (!rawReply) {
     return "โอ๊ะ ขอโทษนะ ตอนนี้ฉันสมองแล็ก ลองถามใหม่อีกทีได้เลย 🥲";
   }
+
+  const { reply, newFact } = extractMemoryTag(rawReply);
+
+  recentHistory.push(userTurn, { role: "assistant", content: reply });
+  await saveChatHistory(userKey, recentHistory.slice(-MAX_CHAT_HISTORY));
+
+  if (newFact && !importantFacts.includes(newFact)) {
+    const updatedFacts = importantFacts.length >= MAX_IMPORTANT_FACTS
+      ? await pruneImportantFacts(importantFacts, newFact)
+      : [...importantFacts, newFact];
+    await saveImportantFacts(userKey, updatedFacts);
+  }
+
+  return reply;
 }
 
 // ── LINE Webhook ─────────────────────────────────────────────────────────────
@@ -181,8 +297,7 @@ async function handleEvent(event) {
 
   // ── Secret reset — เงียบสนิท ไม่ตอบ ไม่มีใครรู้ ──────────────────────────
   if (text === SECRET_RESET) {
-    const contextId = source.groupId || source.roomId || source.userId;
-    await deleteHistory(contextId);
+    await resetUserMemory(`line:${source.userId}`);
     return; // ไม่ reply อะไรเลย
   }
 
@@ -222,7 +337,7 @@ async function handleEvent(event) {
   const contextId = source.groupId || source.roomId || source.userId;
 
   if (cleanText === "!reset" || cleanText === "/reset") {
-    await deleteHistory(contextId);
+    await resetUserMemory(`line:${source.userId}`);
     return lineClient.replyMessage(event.replyToken, {
       type: "text",
       text: "ล้างความจำแล้วนะ เริ่มใหม่กันเลย! 🧹✨",
@@ -249,7 +364,7 @@ async function handleEvent(event) {
     });
   }
 
-  const reply = await askGroq(contextId, cleanText, displayName);
+  const reply = await askAI(contextId, cleanText, displayName, "line", source.userId, isGroup);
   saveReply(displayName, cleanText, reply);
 
   if (isGroup && source.userId) {
@@ -379,7 +494,7 @@ if (process.env.DISCORD_BOT_TOKEN) {
     if (!cleanText) cleanText = "สวัสดี";
 
     if (cleanText === "!reset" || cleanText === "/reset") {
-      await deleteHistory(message.channelId);
+      await resetUserMemory(`discord:${message.author.id}`);
       return message.reply("ล้างความจำแล้วนะ เริ่มใหม่กันเลย! 🧹✨");
     }
 
@@ -426,7 +541,7 @@ if (process.env.DISCORD_BOT_TOKEN) {
 
     await message.channel.sendTyping();
 
-    const reply = await askGroq(contextId, cleanText, displayName, "discord");
+    const reply = await askAI(contextId, cleanText, displayName, "discord", message.author.id, isGuild);
     saveReply(displayName, cleanText, reply);
 
     if (isGuild) {

@@ -8,6 +8,7 @@
     "dev": "nodemon index.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.110.0",
     "@discordjs/voice": "^0.19.2",
     "@line/bot-sdk": "^9.3.0",
     "@upstash/redis": "^1.38.0",
